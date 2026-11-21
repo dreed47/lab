@@ -1,6 +1,7 @@
 ---
 name: lab
 description: "Use when the homelab comes up. Run lab first."
+argument-hint: "[status|ha|on|where|find|guest|shell|open|frigate|zigbee|tasks|mem|storage|recordings|init]"
 version: 1.0.0
 license: MIT
 platforms: [linux]
