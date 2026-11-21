@@ -1,0 +1,43 @@
+# Copy to ~/.config/lab/config.toml and edit. This file is an example, not a real house.
+# SSH Host names below must already work with BatchMode. Addresses stay in ~/.ssh/config.
+
+lan = "10.0.0."
+cluster = "node-a"
+
+cluster_nodes = ["node-a", "node-b"]
+shell_hosts = ["node-a", "node-b", "camera"]
+
+[backup]
+start = "02:00"
+end = "02:45"
+note = "Some services stop on purpose."
+
+[ssh]
+users = ["root"]
+
+[pages]
+ha = "https://10.0.0.10:8123"
+proxmox = "https://10.0.0.2:8006/"
+
+[ha]
+vmid = 101
+node = "node-b"
+url = "https://10.0.0.10:8123"
+
+[zigbee]
+config = "/opt/zigbee2mqtt/data/configuration.yaml"
+
+[[zigbee.guests]]
+vmid = 201
+label = "Zigbee2MQTT"
+
+[[zigbee.guests]]
+vmid = 202
+label = "MQTT"
+
+[frigate]
+host = "camera"
+address = "10.0.0.16"
+url = "https://10.0.0.16:8971"
+container = "frigate"
+recordings = "/mnt/recordings"

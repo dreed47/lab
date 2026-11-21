@@ -1,0 +1,1172 @@
+#!/usr/bin/env python3
+"""Homelab front door. One file plus OpenSSH. House-specific names live in config."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tomllib
+import urllib.parse
+from pathlib import Path
+
+SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-T"]
+CONSOLE_TASKS = {"vncproxy", "vncshell", "spiceproxy", "termproxy"}
+_CONFIG: dict | None = None
+_CONFIG_PATH: Path | None = None
+
+
+def config_path() -> Path | None:
+    env = os.environ.get("LAB_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    home = Path.home() / ".config" / "lab" / "config.toml"
+    if home.exists():
+        return home
+    beside = Path(__file__).resolve().parent / "lab.toml"
+    if beside.exists():
+        return beside
+    return None
+
+
+def parse_clock(value: str) -> dt.time:
+    hour, minute = value.split(":", 1)
+    return dt.time(int(hour), int(minute))
+
+
+def load_config(path: Path | None = None) -> dict:
+    global _CONFIG, _CONFIG_PATH
+    if path is None and _CONFIG is not None:
+        return _CONFIG
+    found = path or config_path()
+    if found is None or not found.exists():
+        raise SystemExit(
+            "No lab config. Copy lab.example.toml to ~/.config/lab/config.toml"
+        )
+    raw = tomllib.loads(found.read_text())
+    backup = raw.get("backup") or {}
+    if backup.get("start") and backup.get("end"):
+        backup = dict(backup)
+        backup["start"] = parse_clock(str(backup["start"]))
+        backup["end"] = parse_clock(str(backup["end"]))
+        raw["backup"] = backup
+    _CONFIG = raw
+    _CONFIG_PATH = found
+    return raw
+
+
+def cfg() -> dict:
+    return load_config()
+
+
+def cluster_host() -> str:
+    host = cfg().get("cluster")
+    if not host:
+        raise SystemExit("cluster host is not configured. Set cluster in the config.")
+    return str(host)
+
+
+def cluster_nodes() -> list[str]:
+    return [str(name) for name in cfg().get("cluster_nodes") or []]
+
+
+def shell_hosts() -> list[str]:
+    hosts = cfg().get("shell_hosts")
+    if hosts:
+        return [str(name) for name in hosts]
+    return cluster_nodes()
+
+
+def pages() -> dict:
+    return dict(cfg().get("pages") or {})
+
+
+def lan_prefix() -> str:
+    return str(cfg().get("lan") or "")
+
+
+def ssh_users() -> list[str]:
+    users = (cfg().get("ssh") or {}).get("users") or ["root"]
+    return [str(user) for user in users]
+
+
+def backup_window() -> tuple[dt.time, dt.time] | None:
+    backup = cfg().get("backup") or {}
+    start = backup.get("start")
+    end = backup.get("end")
+    if isinstance(start, dt.time) and isinstance(end, dt.time):
+        return start, end
+    return None
+
+
+def backup_note() -> str:
+    return str((cfg().get("backup") or {}).get("note") or "Some services stop on purpose.")
+
+
+def window_label(window: tuple[dt.time, dt.time] | None = None) -> str:
+    window = window if window is not None else backup_window()
+    if window is None:
+        return ""
+    return f"{window[0].strftime('%H:%M')}-{window[1].strftime('%H:%M')}"
+
+
+def section(name: str) -> dict | None:
+    data = cfg().get(name)
+    return data if isinstance(data, dict) and data else None
+
+
+def require_section(name: str) -> dict:
+    data = section(name)
+    if data is None:
+        where = _CONFIG_PATH or "~/.config/lab/config.toml"
+        raise SystemExit(f"{name} is not configured. Add [{name}] to {where}.")
+    return data
+
+
+def on_lan(ip: str) -> bool:
+    if not ip or ip.startswith("127."):
+        return False
+    prefix = lan_prefix()
+    if prefix:
+        return ip.startswith(prefix)
+    return True
+
+
+
+def ssh(host: str, remote: str, timeout: int = 30) -> str:
+    try:
+        done = subprocess.run(
+            SSH + [host, remote],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"{host}: timed out") from None
+    if done.returncode != 0:
+        err = (done.stderr or done.stdout).strip()
+        raise SystemExit(err or f"{host}: ssh failed ({done.returncode})")
+    return done.stdout
+
+
+def in_backup(now: dt.time | None = None, window: tuple[dt.time, dt.time] | None = None) -> bool:
+    if window is None:
+        window = backup_window()
+    if window is None:
+        return False
+    if now is None:
+        now = dt.datetime.now().astimezone().time()
+    return window[0] <= now < window[1]
+
+
+def cluster() -> tuple[list, list]:
+    raw = ssh(
+        cluster_host(),
+        "echo ---STATUS---; pvesh get /cluster/status --output-format json; "
+        "echo ---VMS---; pvesh get /cluster/resources --type vm --output-format json",
+        timeout=45,
+    )
+    status_raw, vm_raw = raw.split("---VMS---", 1)
+    status_raw = status_raw.split("---STATUS---", 1)[1]
+    return json.loads(status_raw), json.loads(vm_raw)
+
+
+def frigate() -> tuple[bool, str]:
+    spec = require_section("frigate")
+    container = shlex.quote(str(spec.get("container") or "frigate"))
+    out = ssh(
+        str(spec["host"]),
+        "docker inspect -f '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "
+        + container,
+    ).strip()
+    running, _, health = out.partition(" ")
+    return running == "true", health or "none"
+
+
+def guest(vms: list, vmid: int) -> dict | None:
+    for row in vms:
+        if int(row["vmid"]) == vmid:
+            return row
+    return None
+
+
+def resolve(token: str, vms: list) -> dict:
+    token = token.strip()
+    if token.isdigit():
+        row = guest(vms, int(token))
+        if row is None:
+            raise SystemExit(f"No guest numbered {token}.")
+        return row
+    matches = [row for row in vms if (row.get("name") or "").lower() == token.lower()]
+    if not matches:
+        raise SystemExit(f"No guest named {token}.")
+    if len(matches) > 1:
+        where = ", ".join(
+            f"{row['vmid']} on {row['node']} ({row['status']})" for row in matches
+        )
+        raise SystemExit(f"{token} matches more than one guest: {where}")
+    return matches[0]
+
+
+def guest_rows(vms: list) -> list[dict]:
+    return sorted(
+        (
+            {
+                "vmid": int(row["vmid"]),
+                "type": "vm" if row.get("type") == "qemu" else "ct",
+                "name": row.get("name") or "",
+                "status": row.get("status") or "",
+                "node": row.get("node") or "",
+            }
+            for row in vms
+        ),
+        key=lambda row: row["vmid"],
+    )
+
+
+def print_guest_table(rows: list[dict]) -> None:
+    print(f"{'#':>5}  {'type':<4}  {'status':<10}  {'node':<6}  name")
+    for row in rows:
+        print(
+            f"{row['vmid']:>5}  {row['type']:<4}  {row['status']:<10}  {row['node']:<6}  {row['name']}"
+        )
+
+
+def snapshot() -> dict:
+    status, vms = cluster()
+    if section("frigate"):
+        try:
+            up, health = frigate()
+            frigate_error = ""
+        except SystemExit as err:
+            up, health, frigate_error = False, "unknown", str(err)
+    else:
+        up, health, frigate_error = False, "", ""
+    nodes = [row for row in status if row.get("type") == "node"]
+    nodes.sort(key=lambda row: row.get("nodeid") or 0)
+    cluster_row = next(row for row in status if row.get("type") == "cluster")
+    guests = guest_rows(vms)
+    running = sum(1 for row in guests if row["status"] == "running")
+    return {
+        "name": cluster_row.get("name"),
+        "quorate": bool(cluster_row.get("quorate")),
+        "nodes": [{"name": row["name"], "online": bool(row.get("online"))} for row in nodes],
+        "guests_running": running,
+        "guests_stopped": len(guests) - running,
+        "guests": guests,
+        "frigate": {"running": up, "health": health, "error": frigate_error},
+        "backup_window": in_backup(),
+    }
+
+
+def print_status(snap: dict) -> None:
+    online = sum(1 for row in snap["nodes"] if row["online"])
+    quorum = "quorate" if snap["quorate"] else "NO QUORUM"
+    print(f"{snap['name']}  {quorum}  {online}/{len(snap['nodes'])} nodes")
+    print("  ".join(f"{row['name']} {'up' if row['online'] else 'DOWN'}" for row in snap["nodes"]))
+    print(f"guests  {snap['guests_running']} running, {snap['guests_stopped']} stopped")
+    if section("frigate"):
+        frig = snap["frigate"]
+        state = "running" if frig["running"] else "down"
+        print(f"{section('frigate')['host']}  {state}  {frig['health']}")
+        if frig["error"]:
+            print(f"  {frig['error']}")
+    print_guest_table(snap["guests"])
+    if snap["backup_window"]:
+        print(f"Backup window ({window_label()}). {backup_note()}")
+    elif backup_window():
+        print(f"Outside the {window_label()} backup window.")
+
+
+def cmd_status(as_json: bool) -> int:
+    snap = snapshot()
+    if as_json:
+        print(json.dumps(snap, indent=2))
+    else:
+        print_status(snap)
+    return 0
+
+
+def cmd_frigate() -> int:
+    spec = require_section("frigate")
+    up, health = frigate()
+    _, vms = cluster()
+    state = "running" if up else "down"
+    address = spec.get("address") or spec["host"]
+    print(f"{spec['host']} {address}  {state}  {health}")
+    if spec.get("url"):
+        print(spec["url"])
+    old = spec.get("old_vmid")
+    if old:
+        row = guest(vms, int(old))
+        if row is None:
+            print(f"CT {old}  not on the cluster")
+        else:
+            print(f"CT {old}  {row['status']} on {row['node']}")
+    return 0
+
+
+def refuse_shell_host(node: str) -> None:
+    if node in shell_hosts() and node not in cluster_nodes():
+        raise SystemExit(f"{node} is a shell host, not a cluster node.")
+    if node not in cluster_nodes():
+        raise SystemExit(f"Unknown node {node}. Known: {', '.join(cluster_nodes())}")
+
+
+def task_window(now: dt.datetime | None = None) -> tuple[float, float]:
+    now = now or dt.datetime.now().astimezone()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0) - dt.timedelta(days=1)
+    return start.timestamp(), now.timestamp() + 300
+
+
+def task_is_problem(row: dict, start: float, end: float) -> bool:
+    stamp = row.get("starttime") or 0
+    if stamp < start or stamp > end:
+        return False
+    if row.get("type") in CONSOLE_TASKS:
+        return False
+    return row.get("status") not in (None, "OK")
+
+
+def task_notes(node: str, upid: str) -> list[str]:
+    raw = ssh(
+        node,
+        f"pvesh get '/nodes/{node}/tasks/{upid}/log' --limit 5000 --output-format json",
+        timeout=45,
+    )
+    last = ""
+    notes = []
+    for row in json.loads(raw):
+        line = row.get("t") or ""
+        found = re.search(r"vzdump-(?:lxc|qemu)-(\d+)-", line) or re.search(r"\bVM (\d+)\b", line)
+        if found:
+            last = found.group(1)
+        if line.startswith(("WARN:", "ERROR:")):
+            notes.append(f"{last}  {line}" if last else line)
+    return notes
+
+
+def cmd_tasks() -> int:
+    rows = json.loads(ssh(cluster_host(), "pvesh get /cluster/tasks --output-format json", timeout=45))
+    start, end = task_window()
+    since = dt.datetime.fromtimestamp(start).strftime("%A %H:%M")
+    in_window = [
+        row
+        for row in rows
+        if start <= (row.get("starttime") or 0) <= end and row.get("type") not in CONSOLE_TASKS
+    ]
+    problems = [row for row in in_window if task_is_problem(row, start, end)]
+    problems.sort(key=lambda row: row.get("starttime") or 0)
+    backups_ok = sum(
+        1 for row in in_window if row.get("type") == "vzdump" and row.get("status") == "OK"
+    )
+    print(f"Since {since}: {backups_ok} backups OK, {len(problems)} need a look.")
+    if not problems:
+        return 0
+    for row in problems:
+        when = dt.datetime.fromtimestamp(row["starttime"]).strftime("%a %H:%M")
+        guest = row.get("id") or ""
+        label = f"{when}  {row.get('node')}  {row.get('type')}  {guest}  {row.get('status')}".rstrip()
+        print(label)
+        status = str(row.get("status") or "")
+        if not (status.startswith("WARNINGS") or status.startswith("job errors")):
+            continue
+        try:
+            notes = task_notes(row["node"], row["upid"])
+        except SystemExit as err:
+            print(f"  log unavailable: {err}")
+            continue
+        for note in notes[:8]:
+            print(f"  {note}")
+        if len(notes) > 8:
+            print(f"  {len(notes) - 8} more")
+    return 1 if problems else 0
+
+
+def cmd_zigbee() -> int:
+    spec = require_section("zigbee")
+    guests = spec.get("guests") or []
+    if not guests:
+        raise SystemExit("zigbee is not configured. Add [[zigbee.guests]].")
+    _, vms = cluster()
+    for item in guests:
+        vmid = int(item["vmid"])
+        label = item.get("label") or str(vmid)
+        row = guest(vms, vmid)
+        if row is None:
+            print(f"{label} {vmid}  not on the cluster")
+        else:
+            print(f"{label} {vmid}  {row['status']} on {row['node']}")
+    window = backup_window()
+    if window and in_backup():
+        print(f"Backup window ({window_label(window)}). {backup_note()}")
+    elif window:
+        print(f"Outside the {window_label(window)} backup window.")
+    return 0
+
+
+def cmd_shell(node: str, cmd: list[str]) -> int:
+    if node not in shell_hosts():
+        raise SystemExit(f"Unknown host {node}. Known: {', '.join(shell_hosts())}")
+    if cmd:
+        sys.stdout.write(ssh(node, " ".join(shlex.quote(part) for part in cmd)))
+        return 0
+    tty = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-t", node]
+    return subprocess.call(tty)
+
+
+def vm_mac(node: str, vmid: int) -> str:
+    conf = ssh(node, f"qm config {vmid}")
+    for line in conf.splitlines():
+        if not line.startswith("net0:"):
+            continue
+        for part in line.split(":", 1)[1].split(","):
+            if "=" not in part:
+                continue
+            value = part.split("=", 1)[1].strip()
+            if value.count(":") == 5:
+                return value.lower()
+    raise SystemExit(f"VM {vmid} on {node} has no net0 MAC address.")
+
+
+def lan_from_agent(node: str, vmid: int) -> str | None:
+    try:
+        raw = ssh(node, f"qm guest cmd {vmid} network-get-interfaces")
+    except SystemExit:
+        return None
+    for iface in json.loads(raw):
+        for addr in iface.get("ip-addresses") or []:
+            ip = addr.get("ip-address") or ""
+            if addr.get("ip-address-type") == "ipv4" and on_lan(ip):
+                return ip
+    return None
+
+
+def lan_from_neigh(mac: str) -> str | None:
+    tables = []
+    try:
+        tables.append(json.loads(subprocess.check_output(["ip", "-j", "neigh"], text=True)))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        pass
+    for row in tables[0] if tables else []:
+        ip = row.get("dst") or ""
+        if (row.get("lladdr") or "").lower() == mac and on_lan(ip):
+            return ip
+    return None
+
+
+def vm_address(row: dict) -> str:
+    vmid = int(row["vmid"])
+    found = lan_from_agent(row["node"], vmid)
+    if found:
+        return found
+    mac = vm_mac(row["node"], vmid)
+    found = lan_from_neigh(mac)
+    if found:
+        return found
+    raise SystemExit(f"No LAN address for {row.get('name')} {vmid} (MAC {mac}).")
+
+
+def ssh_login(ip: str) -> str:
+    users = ssh_users()
+    for user in users:
+        done = subprocess.run(
+            SSH + [f"{user}@{ip}", "true"],
+            text=True,
+            capture_output=True,
+            timeout=12,
+        )
+        if done.returncode == 0:
+            return user
+    raise SystemExit(f"SSH to {ip} failed for {', '.join(users)}.")
+
+
+def vm_ssh(row: dict, cmd: list[str]) -> int:
+    ip = vm_address(row)
+    user = ssh_login(ip)
+    target = f"{user}@{ip}"
+    base = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if cmd:
+        done = subprocess.run(
+            base + ["-T", target, " ".join(shlex.quote(part) for part in cmd)],
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        sys.stdout.write(done.stdout)
+        if done.returncode != 0:
+            err = (done.stderr or done.stdout).strip()
+            raise SystemExit(err or f"{target}: ssh failed ({done.returncode})")
+        return 0
+    print(f"{row.get('name')} {row['vmid']}  {target}", file=sys.stderr)
+    return subprocess.call(base + ["-t", target])
+
+
+def cmd_guest(token: str, cmd: list[str]) -> int:
+    _, vms = cluster()
+    row = resolve(token, vms)
+    if row.get("status") != "running":
+        raise SystemExit(f"{row.get('name')} {row['vmid']} is {row.get('status')} on {row['node']}.")
+    vmid = int(row["vmid"])
+    if row.get("type") != "lxc":
+        return vm_ssh(row, cmd)
+    if cmd:
+        remote = f"pct exec {vmid} -- " + " ".join(shlex.quote(part) for part in cmd)
+        sys.stdout.write(ssh(row["node"], remote))
+        return 0
+    return subprocess.call(
+        ["ssh", "-o", "BatchMode=yes", "-t", row["node"], "pct", "enter", str(vmid)]
+    )
+
+
+def cmd_ha(cmd: list[str]) -> int:
+    spec = require_section("ha")
+    vmid = int(spec["vmid"])
+    if not cmd:
+        _, vms = cluster()
+        row = guest(vms, vmid)
+        if row is None:
+            raise SystemExit(f"Home Assistant VM {vmid} is not on the cluster.")
+        print(f"{row.get('name') or 'ha'} {vmid}  {row['status']} on {row['node']}")
+        if spec.get("url"):
+            print(spec["url"])
+        return 0
+    remote = f"qm guest exec {vmid} -- " + " ".join(shlex.quote(part) for part in cmd)
+    data = json.loads(ssh(str(spec["node"]), remote, timeout=60))
+    sys.stdout.write(data.get("out-data") or "")
+    err = data.get("err-data") or ""
+    if err:
+        sys.stderr.write(err)
+    return int(data.get("exitcode") or 0)
+
+
+def human(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+def days_left(used: int, free: int, span_days: float) -> float | None:
+    if used <= 0 or span_days < 1:
+        return None
+    return free / (used / span_days)
+
+
+def parse_friendly_names(text: str) -> list[str]:
+    """Zigbee2MQTT friendly_name lines only. Other keys, including network_key, are ignored."""
+    names = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("friendly_name:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1].strip()
+        if value:
+            names.append(value)
+    return names
+
+
+def find_guests(rows: list[dict], word: str) -> list[dict]:
+    needle = word.lower()
+    found = []
+    for row in rows:
+        if needle in row["name"].lower():
+            found.append(row)
+        elif word.isdigit() and row["vmid"] == int(word):
+            found.append(row)
+    return found
+
+
+def zigbee_friendly_names(node: str, vmid: int, path: str) -> list[str]:
+    remote = (
+        f"pct exec {vmid} -- grep -E "
+        + shlex.quote(r"^[[:space:]]*friendly_name:")
+        + " "
+        + shlex.quote(path)
+    )
+    return parse_friendly_names(ssh(node, remote, timeout=30))
+
+
+def cmd_find(word: str) -> int:
+    word = word.strip()
+    if not word:
+        raise SystemExit("Give a word to search for.")
+    _, vms = cluster()
+    rows = guest_rows(vms)
+    guests = find_guests(rows, word)
+    spec = section("zigbee") or {}
+    listed = spec.get("guests") or []
+    primary = listed[0] if listed else None
+    path = spec.get("config") or ""
+    names: list[str] = []
+    note = ""
+    zigbee_row = None
+    vmid = 0
+    if not primary or not path:
+        note = "Zigbee names not configured."
+    else:
+        vmid = int(primary["vmid"])
+        zigbee_row = guest(vms, vmid)
+        if zigbee_row is None:
+            note = f"Zigbee names skipped: CT {vmid} is not on the cluster."
+        elif zigbee_row.get("status") != "running":
+            note = f"Zigbee names skipped: CT {vmid} is {zigbee_row.get('status')} on {zigbee_row.get('node')}."
+        else:
+            try:
+                names = [
+                    name
+                    for name in zigbee_friendly_names(zigbee_row["node"], vmid, path)
+                    if word.lower() in name.lower()
+                ]
+            except SystemExit as err:
+                note = f"Zigbee names skipped: {err}"
+    if guests:
+        print_guest_table(guests)
+    if names and zigbee_row is not None:
+        where = f"CT {vmid} on {zigbee_row.get('node')}"
+        for name in names:
+            print(f"zigbee  {name}  {where}")
+    if note and not names:
+        print(note)
+    if not guests and not names:
+        if not note:
+            raise SystemExit(f"No match for {word}.")
+        return 1
+    return 0
+
+
+def cmd_on(node: str) -> int:
+    node = node.strip().lower()
+    if node == (section("frigate") or {}).get("host"):
+        raise SystemExit(f"{node} is a shell host, not a cluster node. Use lab frigate.")
+    refuse_shell_host(node)
+    _, vms = cluster()
+    rows = [row for row in guest_rows(vms) if row["node"] == node]
+    print(f"{node}  {len(rows)} guests")
+    if rows:
+        print_guest_table(rows)
+    return 0
+
+
+def cmd_where(token: str) -> int:
+    _, vms = cluster()
+    rows = guest_rows(vms)
+    token = token.strip()
+    if token.isdigit():
+        found = [row for row in rows if row["vmid"] == int(token)]
+    else:
+        found = [row for row in rows if row["name"].lower() == token.lower()]
+    if not found:
+        raise SystemExit(f"No guest named {token}.")
+    print_guest_table(found)
+    return 0
+
+
+def cmd_mem(node: str | None = None) -> int:
+    if node:
+        node = node.strip().lower()
+        if node == (section("frigate") or {}).get("host"):
+            raise SystemExit(f"{node} is a shell host, not a cluster node.")
+        refuse_shell_host(node)
+        nodes = [node]
+    else:
+        nodes = cluster_nodes()
+    raw = ssh(
+        cluster_host(),
+        "for n in "
+        + " ".join(nodes)
+        + "; do echo ---$n---; pvesh get /nodes/$n/status --output-format json || echo FAIL; done",
+        timeout=60,
+    )
+    print(f"{'node':<6}  {'RAM':<22}  {'swap':<22}")
+    parts = re.split(r"---(\w+)---", raw)
+    for name, body in zip(parts[1::2], parts[2::2]):
+        body = body.strip()
+        start_at = body.find("{")
+        if body == "FAIL" or start_at < 0:
+            print(f"{name:<6}  unreachable")
+            continue
+        data = json.loads(body[start_at : body.rfind("}") + 1])
+        mem = data.get("memory") or {}
+        swap = data.get("swap") or {}
+        used = int(mem.get("used") or 0)
+        total = int(mem.get("total") or 0)
+        swap_used = int(swap.get("used") or 0)
+        swap_total = int(swap.get("total") or 0)
+        note = ""
+        if total and used / total >= 0.85:
+            note = "  tight"
+        elif swap_total and swap_used / swap_total >= 0.25:
+            note = "  swapping"
+        print(
+            f"{name:<6}  {human(used)} / {human(total):<10}  "
+            f"{human(swap_used)} / {human(swap_total):<10}{note}"
+        )
+    return 0
+
+
+def cmd_storage(node: str | None = None) -> int:
+    if node:
+        node = node.strip().lower()
+        if node == (section("frigate") or {}).get("host"):
+            raise SystemExit(f"{node} is a shell host, not a cluster node. Use lab recordings.")
+        refuse_shell_host(node)
+    rows = json.loads(
+        ssh(cluster_host(), "pvesh get /cluster/resources --type storage --output-format json", timeout=45)
+    )
+    if node:
+        rows = [row for row in rows if (row.get("node") or "").lower() == node]
+    shared: dict[str, dict] = {}
+    local = []
+    for row in rows:
+        if row.get("status") not in (None, "available"):
+            continue
+        if row.get("shared"):
+            shared.setdefault(row.get("storage") or "", row)
+        else:
+            local.append(row)
+    print(f"{'where':<8}  {'storage':<16}  {'used':<14}  {'total':<14}  full")
+    for name in sorted(shared):
+        row = shared[name]
+        used = int(row.get("disk") or 0)
+        total = int(row.get("maxdisk") or 0)
+        pct = f"{used / total * 100:.0f}%" if total else ""
+        print(f"{'shared':<8}  {name:<16}  {human(used):<14}  {human(total):<14}  {pct}")
+    for row in sorted(local, key=lambda item: (item.get("node") or "", item.get("storage") or "")):
+        used = int(row.get("disk") or 0)
+        total = int(row.get("maxdisk") or 0)
+        pct = f"{used / total * 100:.0f}%" if total else ""
+        print(
+            f"{row.get('node'):<8}  {row.get('storage'):<16}  {human(used):<14}  "
+            f"{human(total):<14}  {pct}"
+        )
+    return 0
+
+
+def cmd_recordings() -> int:
+    spec = require_section("frigate")
+    mount = spec.get("recordings")
+    if not mount:
+        raise SystemExit("recordings path is not configured. Set frigate.recordings.")
+    recordings = str(mount).rstrip("/") + "/recordings"
+    quoted_mount = shlex.quote(str(mount))
+    quoted_recordings = shlex.quote(recordings)
+    raw = ssh(
+        str(spec["host"]),
+        f"df -B1 {quoted_mount} | awk 'NR==2 {{print $2, $3, $4}}'; echo ---; "
+        f"du -sb {quoted_recordings} | awk '{{print $1}}'; echo ---; "
+        f"ls -1 {quoted_recordings}",
+        timeout=90,
+    )
+    df_raw, rest = raw.split("---", 1)
+    used_share_raw, dates_raw = rest.split("---", 1)
+    size, used, free = (int(part) for part in df_raw.split())
+    recordings = int(used_share_raw.strip())
+    dates = sorted(line for line in dates_raw.split() if re.fullmatch(r"\d{4}-\d{2}-\d{2}", line))
+    print(f"{mount}  {human(used)} used, {human(free)} free, {used / size * 100:.0f}%")
+    print(f"recordings      {human(recordings)}")
+    if not dates:
+        return 0
+    oldest = dt.datetime.strptime(dates[0], "%Y-%m-%d")
+    span = max((dt.datetime.now() - oldest).total_seconds() / 86400, 1)
+    per_day = recordings / span
+    left = days_left(recordings, free, span)
+    print(f"since {dates[0]}  about {human(int(per_day))} per day")
+    if left is None:
+        return 0
+    if left >= 365:
+        print(f"free space lasts about {left / 365:.0f} years at that rate")
+    else:
+        print(f"free space lasts about {left:.0f} days at that rate")
+    return 0
+
+
+def open_urls(text: str) -> list[str]:
+    return re.findall(r"(?im)^\s*open:\s*(https?://\S+)", text)
+
+
+def guest_description(row: dict) -> str:
+    tool = "qm" if row["type"] == "vm" else "pct"
+    conf = ssh(row["node"], f"{tool} config {int(row['vmid'])}")
+    for line in conf.splitlines():
+        if line.startswith("description:"):
+            return urllib.parse.unquote(line.split(":", 1)[1].strip())
+    return ""
+
+
+def cmd_open(page: str) -> int:
+    token = page.strip()
+    _, vms = cluster()
+    rows = guest_rows(vms)
+    if token.isdigit():
+        found = [row for row in rows if row["vmid"] == int(token)]
+    else:
+        found = [row for row in rows if row["name"].lower() == token.lower()]
+    urls: list[str] = []
+    for row in found:
+        urls.extend(open_urls(guest_description(row)))
+    if not urls:
+        fallback = pages().get(token.lower())
+        if fallback:
+            urls = [fallback]
+    seen: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.append(url)
+    if not seen:
+        raise SystemExit(
+            f"No open: line for {page}. In the guest notes, add a line like:\n"
+            "open: http://10.0.0.5:32400/"
+        )
+    for url in seen:
+        print(url)
+    if len(seen) != 1 or os.environ.get("LAB_OPEN") == "0" or not sys.stdout.isatty():
+        return 0
+    subprocess.Popen(
+        ["xdg-open", seen[0]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return 0
+
+
+def toml_str(value: str) -> str:
+    if any(ch in value for ch in '"\n\\'):
+        raise SystemExit(f"Config value cannot contain quotes or newlines: {value}")
+    return f'"{value}"'
+
+
+def ssh_config_hosts(text: str) -> list[str]:
+    names = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("host "):
+            continue
+        for name in stripped.split()[1:]:
+            if "*" in name or name in names:
+                continue
+            names.append(name)
+    return names
+
+
+def render_config(opts: dict, ssh_hosts: list[str] | None = None) -> str:
+    """Build a starting config. Optional sections are omitted when empty."""
+    if not opts.get("cluster") or not opts.get("nodes"):
+        raise SystemExit("init needs a cluster host and at least one cluster node.")
+    nodes = [part.strip() for part in opts["nodes"] if part.strip()]
+    shell = list(nodes)
+    for part in opts.get("shell") or []:
+        name = part.strip()
+        if name and name not in shell:
+            shell.append(name)
+    lines = [
+        "# Generated by lab init. SSH addresses stay in ~/.ssh/config.",
+        f"lan = {toml_str(opts.get('lan') or '')}",
+        f"cluster = {toml_str(opts['cluster'])}",
+        "",
+        "cluster_nodes = [" + ", ".join(toml_str(name) for name in nodes) + "]",
+        "shell_hosts = [" + ", ".join(toml_str(name) for name in shell) + "]",
+    ]
+    if ssh_hosts:
+        lines.append("# SSH hosts seen locally: " + ", ".join(ssh_hosts))
+    backup = opts.get("backup") or ""
+    if backup:
+        start, _, end = backup.partition("-")
+        lines += ["", "[backup]", f"start = {toml_str(start)}", f"end = {toml_str(end)}"]
+        if opts.get("backup_note"):
+            lines.append(f"note = {toml_str(opts['backup_note'])}")
+    users = [part.strip() for part in (opts.get("ssh_users") or ["root"]) if part.strip()]
+    lines += ["", "[ssh]", "users = [" + ", ".join(toml_str(user) for user in users) + "]"]
+    pages = opts.get("pages") or {}
+    if pages:
+        lines += ["", "[pages]"]
+        for name in sorted(pages):
+            lines.append(f"{name} = {toml_str(pages[name])}")
+    if opts.get("ha_vmid") and opts.get("ha_node"):
+        lines += ["", "[ha]", f"vmid = {int(opts['ha_vmid'])}", f"node = {toml_str(opts['ha_node'])}"]
+        if opts.get("ha_url"):
+            lines.append(f"url = {toml_str(opts['ha_url'])}")
+    zigbee = opts.get("zigbee") or []
+    if zigbee:
+        lines += ["", "[zigbee]"]
+        if opts.get("zigbee_config"):
+            lines.append(f"config = {toml_str(opts['zigbee_config'])}")
+        for vmid, label in zigbee:
+            lines += ["", "[[zigbee.guests]]", f"vmid = {int(vmid)}", f"label = {toml_str(label)}"]
+    if opts.get("frigate_host"):
+        lines += ["", "[frigate]", f"host = {toml_str(opts['frigate_host'])}"]
+        for key, field in (
+            ("address", "frigate_address"),
+            ("url", "frigate_url"),
+            ("container", "frigate_container"),
+            ("recordings", "frigate_recordings"),
+        ):
+            if opts.get(field):
+                lines.append(f"{key} = {toml_str(opts[field])}")
+        if opts.get("frigate_old_vmid"):
+            lines.append(f"old_vmid = {int(opts['frigate_old_vmid'])}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def parse_zigbee_arg(text: str) -> list[tuple[int, str]]:
+    if not text.strip():
+        return []
+    guests = []
+    for part in text.split(","):
+        vmid, _, label = part.strip().partition(":")
+        if not vmid.isdigit() or not label.strip():
+            raise SystemExit(f"Zigbee guest must be vmid:Label, not {part.strip()}.")
+        guests.append((int(vmid), label.strip()))
+    return guests
+
+
+def parse_pages(items: list[str]) -> dict:
+    pages = {}
+    for item in items:
+        name, _, url = item.partition("=")
+        if not name.strip() or not url.strip():
+            raise SystemExit(f"Page must be name=url, not {item}.")
+        pages[name.strip()] = url.strip()
+    return pages
+
+
+def cmd_init(args) -> int:
+    if not args.cluster:
+        raise SystemExit(
+            "lab init needs answers. An agent should follow skills/lab/init-prompt.md, "
+            "then pass --cluster and --nodes. Add --print to preview, --write to save."
+        )
+    opts = {
+        "cluster": args.cluster,
+        "nodes": args.nodes.split(","),
+        "shell": args.shell.split(",") if args.shell else [],
+        "lan": args.lan,
+        "ssh_users": args.ssh_users.split(","),
+        "backup": args.backup,
+        "backup_note": args.backup_note,
+        "pages": parse_pages(args.page),
+        "ha_vmid": args.ha_vmid,
+        "ha_node": args.ha_node,
+        "ha_url": args.ha_url,
+        "zigbee": parse_zigbee_arg(args.zigbee),
+        "zigbee_config": args.zigbee_config,
+        "frigate_host": args.frigate_host,
+        "frigate_address": args.frigate_address,
+        "frigate_url": args.frigate_url,
+        "frigate_container": args.frigate_container,
+        "frigate_recordings": args.frigate_recordings,
+        "frigate_old_vmid": args.frigate_old_vmid,
+    }
+    hosts = ssh_config_hosts((Path.home() / ".ssh" / "config").read_text()) if (Path.home() / ".ssh" / "config").exists() else []
+    text = render_config(opts, hosts)
+    if args.show or not args.write:
+        print(text, end="")
+        if not args.write:
+            print("Preview only. Re-run with --write to save.", file=sys.stderr)
+            return 0
+    dest = Path(args.out).expanduser() if args.out else Path.home() / ".config" / "lab" / "config.toml"
+    if dest.exists() and not args.force:
+        raise SystemExit(f"{dest} already exists. Pass --force to replace it.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text)
+    print(f"Wrote {dest}", file=sys.stderr)
+    return 0
+
+
+def self_check() -> int:
+    window = (dt.time(2, 0), dt.time(2, 45))
+    assert in_backup(dt.time(2, 0), window)
+    assert in_backup(dt.time(2, 44), window)
+    assert not in_backup(dt.time(2, 45), window)
+    assert not in_backup(dt.time(13, 0), window)
+    start, end = task_window(dt.datetime(2026, 11, 7, 14, 0))
+    assert dt.datetime.fromtimestamp(start).hour == 0
+    ok = {"starttime": start + 60, "type": "vzdump", "status": "OK"}
+    warn = {"starttime": start + 120, "type": "vzdump", "status": "WARNINGS: 1"}
+    console = {"starttime": start + 120, "type": "vncproxy", "status": "WARNINGS: 1"}
+    future = {"starttime": end + 86400, "type": "vzdump", "status": "WARNINGS: 1"}
+    assert not task_is_problem(ok, start, end)
+    assert task_is_problem(warn, start, end)
+    assert not task_is_problem(console, start, end)
+    assert not task_is_problem(future, start, end)
+    assert human(1536) == "1.5 KiB"
+    assert days_left(100, 1000, 10) == 100
+    assert days_left(0, 1000, 10) is None
+    sample_note = urllib.parse.unquote(
+        "open%3A http%3A//10.0.0.5%3A32400/%0Aother text"
+    )
+    assert open_urls(sample_note) == ["http://10.0.0.5:32400/"]
+    sample_rows = guest_rows(
+        [
+            {"vmid": 203, "type": "lxc", "name": "adguard", "status": "running", "node": "node-a"},
+            {"vmid": 103, "type": "lxc", "name": "adguard", "status": "stopped", "node": "node-b"},
+        ]
+    )
+    assert [row["vmid"] for row in sample_rows] == [103, 203]
+    sample = [
+        {"vmid": 101, "name": "ha", "node": "node-b", "status": "running"},
+        {"vmid": 103, "name": "adguard", "node": "node-c", "status": "stopped"},
+        {"vmid": 203, "name": "adguard", "node": "node-a", "status": "running"},
+    ]
+    assert resolve("101", sample)["name"] == "ha"
+    assert resolve("HA", sample)["vmid"] == 101
+    try:
+        resolve("adguard", sample)
+    except SystemExit as err:
+        assert "more than one" in str(err)
+    else:
+        raise SystemExit("adguard should be ambiguous")
+    sample = """
+    friendly_name: Garage Plug
+    friendly_name: 'Kitchen Sink Leak '
+    network_key: [1, 2, 3]
+    friendly_name: Front Door Sensor
+"""
+    assert parse_friendly_names(sample) == ["Garage Plug", "Kitchen Sink Leak", "Front Door Sensor"]
+    hits = find_guests(sample_rows, "adguard")
+    assert [row["vmid"] for row in hits] == [103, 203]
+    assert find_guests(sample_rows, "9999") == []
+    assert [row["vmid"] for row in find_guests(sample_rows, "103")] == [103]
+    example = (Path(__file__).resolve().parent / "lab.example.toml").read_text()
+    parsed = tomllib.loads(example)
+    assert parsed["cluster"] == "node-a"
+    house = "192" + ".168"
+    assert house not in example
+    assert house not in Path(__file__).read_text()
+    starter = render_config({
+        "cluster": "node-a",
+        "nodes": ["node-a", "node-b"],
+        "shell": ["camera"],
+        "lan": "10.0.0.",
+        "ssh_users": ["root"],
+        "pages": {},
+        "zigbee": [],
+    })
+    loaded = tomllib.loads(starter)
+    assert loaded["cluster"] == "node-a"
+    assert loaded["shell_hosts"] == ["node-a", "node-b", "camera"]
+    assert "zigbee" not in loaded
+    assert ssh_config_hosts("Host node-a\nHost *\n  HostName 10.0.0.2\n") == ["node-a"]
+    print("ok")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="lab", description="Homelab front door.")
+    parser.add_argument("--self-check", action="store_true")
+    sub = parser.add_subparsers(dest="cmd", required=False)
+
+    status = sub.add_parser("status", help="quorum, Frigate, and every container and VM")
+    status.add_argument("--json", action="store_true")
+    sub.add_parser("frigate", help="camera host from config, if set")
+    sub.add_parser("zigbee", help="Zigbee guests from config, if set")
+    sub.add_parser("tasks", help="cluster jobs that failed since yesterday")
+    on = sub.add_parser("on", help="guests on one cluster node")
+    on.add_argument("node")
+    where = sub.add_parser("where", help="every guest with this number or name")
+    where.add_argument("name")
+    find_p = sub.add_parser("find", help="guest names and Zigbee friendly names matching a word")
+    find_p.add_argument("word")
+    init_p = sub.add_parser("init", help="write a starting config from answers")
+    init_p.add_argument("--print", action="store_true", dest="show")
+    init_p.add_argument("--write", action="store_true")
+    init_p.add_argument("--force", action="store_true")
+    init_p.add_argument("--out")
+    init_p.add_argument("--cluster")
+    init_p.add_argument("--nodes", default="")
+    init_p.add_argument("--shell", default="")
+    init_p.add_argument("--lan", default="")
+    init_p.add_argument("--ssh-users", default="root")
+    init_p.add_argument("--backup", default="")
+    init_p.add_argument("--backup-note", default="")
+    init_p.add_argument("--page", action="append", default=[])
+    init_p.add_argument("--ha-vmid", type=int)
+    init_p.add_argument("--ha-node")
+    init_p.add_argument("--ha-url")
+    init_p.add_argument("--zigbee", default="")
+    init_p.add_argument("--zigbee-config", default="")
+    init_p.add_argument("--frigate-host")
+    init_p.add_argument("--frigate-address")
+    init_p.add_argument("--frigate-url")
+    init_p.add_argument("--frigate-container", default="")
+    init_p.add_argument("--frigate-recordings")
+    init_p.add_argument("--frigate-old-vmid", type=int)
+    mem = sub.add_parser("mem", help="RAM and swap on one node, or every node")
+    mem.add_argument("node", nargs="?")
+    storage = sub.add_parser("storage", help="disk on one node, or every node and the shared storage")
+    storage.add_argument("node", nargs="?")
+    sub.add_parser("recordings", help="recording disk from config, if set")
+    open_p = sub.add_parser("open", help="open the URL from a guest's notes, or a known page")
+    open_p.add_argument("page")
+
+    shell = sub.add_parser("shell", help="shell on a node, or one command")
+    shell.add_argument("node")
+    shell.add_argument("remote", nargs=argparse.REMAINDER)
+
+    guest_p = sub.add_parser("guest", help="login to a container or VM by number or name")
+    guest_p.add_argument("vmid")
+    guest_p.add_argument("remote", nargs=argparse.REMAINDER)
+
+    ha = sub.add_parser("ha", help="Home Assistant status, or one command inside the VM")
+    ha.add_argument("remote", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+    if args.self_check:
+        return self_check()
+    if args.cmd == "status":
+        return cmd_status(args.json)
+    if args.cmd == "frigate":
+        return cmd_frigate()
+    if args.cmd == "zigbee":
+        return cmd_zigbee()
+    if args.cmd == "tasks":
+        return cmd_tasks()
+    if args.cmd == "on":
+        return cmd_on(args.node)
+    if args.cmd == "where":
+        return cmd_where(args.name)
+    if args.cmd == "find":
+        return cmd_find(args.word)
+    if args.cmd == "init":
+        return cmd_init(args)
+    if args.cmd == "mem":
+        return cmd_mem(args.node)
+    if args.cmd == "storage":
+        return cmd_storage(args.node)
+    if args.cmd == "recordings":
+        return cmd_recordings()
+    if args.cmd == "open":
+        return cmd_open(args.page)
+    if args.cmd == "shell":
+        return cmd_shell(args.node, args.remote)
+    if args.cmd == "guest":
+        return cmd_guest(args.vmid, args.remote)
+    if args.cmd == "ha":
+        return cmd_ha(args.remote)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
