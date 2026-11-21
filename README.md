@@ -32,7 +32,7 @@ lab --self-check
 
 ## Agent skill
 
-Optional. The program runs without it. The skill tells an agent to run `lab` first, and what not to touch. It has no house in it.
+Optional. The program runs without it. The skill tells an agent to run `lab` first, and what not to touch. It does not contain your host names.
 
 Hermes, or any agent that reads the Agent Skills format:
 
@@ -54,7 +54,23 @@ lab init --write --cluster node-a --nodes node-a,node-b --lan 10.0.0.
 
 `--print` previews. `--write` saves `~/.config/lab/config.toml`. It will not replace an existing file unless you pass `--force`.
 
-An agent should follow `skills/lab/init-prompt.md`: ask for the host names and guest numbers, preview, then write. It should not invent them.
+An agent should follow `skills/lab/init-prompt.md`: ask for the host names and guest numbers, preview, then write. Do not make those names up.
+
+## More than one computer
+
+`lab` can run on more than one computer. Each computer has two parts, and they are updated differently.
+
+The program is the git checkout. Update it with `git pull` in `~/code/lab`. Do not copy the script from another computer. A copied script goes stale. Edit and push from one checkout. The other computers only pull. Pull before you edit, or an old checkout can push over newer work.
+
+The config is `~/.config/lab/config.toml`. It is not in git. It has your host names. After you change it, copy that one file to every computer that runs `lab`:
+
+```bash
+scp ~/.config/lab/config.toml other-computer:.config/lab/config.toml
+```
+
+If you skip that copy, the other computer still has the old host names.
+
+If you want your agent to keep this in sync, tell it which computers run `lab`. After a script change, it pulls on each one. After a config change, it copies that config file to each one. It does not copy the script. It does not commit the config. It does not start, stop, or migrate guests.
 
 
 

@@ -1,6 +1,6 @@
 # Build a lab config
 
-You are setting up the `lab` homelab front door for a new user. Do not invent host names, addresses, or guest numbers. Ask, then generate the file with `lab init`. Do not hand-write the TOML.
+You are setting up the `lab` homelab front door for a new user. Do not make up host names, addresses, or guest numbers. Ask, then generate the file with `lab init`. Do not hand-write the TOML.
 
 ## Ask
 

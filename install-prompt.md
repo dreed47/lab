@@ -1,6 +1,6 @@
 # Install lab
 
-You are installing the `lab` homelab front door for the person you are talking to. Do the steps below. Do not invent host names, addresses, or guest numbers. Do not copy anyone else's config. Do not start, stop, or migrate guests.
+You are installing the `lab` homelab front door for the person you are talking to. Do the steps below. Do not make up host names, addresses, or guest numbers. Do not copy anyone else's config. Do not start, stop, or migrate guests.
 
 ## Install
 
@@ -33,3 +33,7 @@ Do not commit `~/.config/lab/config.toml`. The preview may list local SSH host n
 ## Finish
 
 Run `lab --self-check`, then one live command they expect to work, such as `lab status`. Report what those commands printed. A password prompt means the key is broken, not that a host is down.
+
+## More than one computer
+
+If they later run `lab` on another computer, do not copy the script there. Clone or pull the repo. Copy only `~/.config/lab/config.toml`. The rules are in the README section "More than one computer" and in the skill. If they want you to keep those copies in sync, ask which computers run `lab`, then pull the script on each and copy the config file to each. Do not commit the config.

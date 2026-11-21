@@ -28,6 +28,7 @@ Reports stay short: bullets, no walls of text.
 ## Rules
 
 - Homelab questions go through `lab` first. Do not invent a second cluster script.
+- Do not make up SSH host names, addresses, or guest numbers. Ask. If a section is missing from the config, say it is not configured.
 - New commands go in the single `lab` file, then `lab --self-check`. Self-check does not SSH.
 - `lab` uses `BatchMode`. A password prompt means the key or `~/.ssh` ownership is broken, not that the host is down.
 - `lab shell` takes the remote program and each argument as separate argv. One quoted string is quoted again and run as a single command name.
@@ -65,4 +66,13 @@ A new guest shows up in status, on, where, guest, and open with no edit. `lab op
 ## First setup
 
 Do not hand-write the config. Follow `init-prompt.md` in this directory, then run `lab init`. Preview with `--print`. Save with `--write` only after the user accepts the preview.
+
+## More than one computer
+
+The program and the config are not updated the same way.
+
+- The program is the git checkout. Update it with `git pull` in the checkout. Do not copy the script from another computer. Edit and push from one checkout. Other computers only pull. Pull before editing, or an old checkout can push over newer work.
+- The config is `~/.config/lab/config.toml`. It is not in git. After a change, copy that one file to every computer that runs `lab`. A computer that did not get the copy still has the old host names.
+- If the user wants you to keep the copies in sync, they must name the computers. Pull the script on each after a script change. Copy the config file to each after a config change. Do not copy the script. Do not commit the config.
+
 
