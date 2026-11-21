@@ -4,6 +4,8 @@ A typed homelab front door. One command for the morning check, and one command t
 
 It is a single Python 3 file. It uses the standard library and OpenSSH. It does not start, stop, or migrate guests.
 
+An agent doing a first install should read [install-prompt.md](install-prompt.md) and do what it says.
+
 ```bash
 lab status
 lab tasks
